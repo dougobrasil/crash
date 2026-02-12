@@ -149,7 +149,6 @@ def registrar_resultado(res):
         
         add_log(f"GREEN em {res:.2f}x (Alvo {state['alvo']})")
         enviar_telegram_resultado(res, state["alvo"], True)
-        winsound.Beep(1200, 400)
         state["ativo"] = False
         state["gale"] = 0
     else:
@@ -157,7 +156,6 @@ def registrar_resultado(res):
             state["gale"] += 1
             add_log(f"Entrando Gale {state['gale']}")
             enviar_telegram_sinal(state["desc"], state["alvo"], state["gale"])
-            winsound.Beep(600, 600)
         else:
             stats["derrotas"] += 1
             add_log(f"RED em {res:.2f}x")
@@ -252,7 +250,6 @@ def monitor():
                         state.update({"ativo": True, "estrategia": est, "alvo": alvo, "desc": desc, "gale": 0})
                         add_log(f"Sinal Detectado: {desc}")
                         enviar_telegram_sinal(desc, alvo)
-                        winsound.Beep(1000, 200); winsound.Beep(1400, 200)
                         draw_interface(historico)
         except Exception as e:
             add_log(f"Erro Processamento: {e}")
