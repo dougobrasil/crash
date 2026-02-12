@@ -1,7 +1,6 @@
 import requests
 import time
 import os
-import winsound
 import threading
 import asyncio
 import logging
