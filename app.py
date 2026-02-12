@@ -1,172 +1,292 @@
-import sys
+import requests
+import time
+import os
+import winsound
+import threading
 import asyncio
-import aiohttp
-import uvicorn
+import logging
 from datetime import datetime
-from threading import Thread
-from fastapi import FastAPI
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QFrame, QPushButton, QGraphicsDropShadowEffect)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QColor
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
+from colorama import Fore, Back, Style, init
 
-# --- CONFIGURAÇÃO DA API WEB ---
-api_app = FastAPI()
-latest_data_store = {"status": "offline", "items": [], "updated_at": ""}
+# Silenciar logs internos para manter o painel limpo
+logging.basicConfig(level=logging.CRITICAL)
+init(autoreset=True)
 
-@api_app.get("/api")
-async def get_api_data():
-    return latest_data_store
+# --- CONFIGURAÇÕES DE ACESSO ---
+# 1. Cole o seu Token aqui
+TELEGRAM_TOKEN = "7512042682:AAEmHzdH0Jen9I8S6sb-OdeDebh5Pb1rkjg"
 
-# --- ENGINE DE CAPTURA ---
-class BackendWorker(QThread):
-    data_signal = pyqtSignal(dict)
-    error_signal = pyqtSignal(str)
+# 2. Cole o ID do seu Grupo aqui (Ex: -100123456789)
+# Use o comando /id no grupo para descobrir o número correto
+CHAT_ID_GRUPO = "-1002632966907" 
 
-    def __init__(self):
-        super().__init__()
-        self.running = False
+URL_API = "https://blaze.bet.br/api/singleplayer-originals/originals/crash_games/recent/4"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Bypass-Tunnel-Reminder": "true"
+}
 
-    def run(self):
-        self.running = True
-        # Inicia o servidor apenas uma vez
-        self.server_thread = Thread(target=self.run_server, daemon=True)
-        self.server_thread.start()
+# --- ESTADO DO SISTEMA ---
+MAX_GALES = 2
+stats = {
+    "vitorias": 0, "derrotas": 0, 
+    "win_15": 0, "win_20": 0, "win_alta": 0,
+    "g1_count": 0, "g2_count": 0
+}
+
+state = {
+    "ativo": False, "gale": 0, "alvo": 2.0, 
+    "estrategia": "", "desc": "", 
+    "status_conexao": "Iniciando...",
+    "status_telegram": "Offline",
+    "logs": []
+}
+
+loop_telegram = None
+application = None
+
+def add_log(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    state["logs"].append(f"[{timestamp}] {msg}")
+    if len(state["logs"]) > 8:
+        state["logs"].pop(0)
+
+# --- FUNÇÕES TELEGRAM ---
+
+async def get_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"📍 ID deste Chat: `{chat_id}`", parse_mode=ParseMode.MARKDOWN)
+
+async def async_broadcast(text):
+    if CHAT_ID_GRUPO == "SEU_CHAT_ID_AQUI" or not CHAT_ID_GRUPO:
+        add_log("Erro: CHAT_ID_GRUPO não configurado!")
+        return
+    try:
+        await application.bot.send_message(chat_id=CHAT_ID_GRUPO, text=text, parse_mode=ParseMode.MARKDOWN)
+        add_log("Mensagem enviada para o grupo.")
+    except Exception as e:
+        add_log(f"Erro ao enviar: {e}")
+
+def enviar_telegram_sinal(desc, alvo, gale=0):
+    if not application: return
+    emoji = "🎯" if gale == 0 else "🔄"
+    txt = "SINAL IDENTIFICADO" if gale == 0 else f"ENTRAR NO GALE {gale}"
+    
+    msg = (
+        f"{emoji} *{txt}* {emoji}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📊 *Estratégia:* {desc}\n"
+        f"📈 *Alvo:* {alvo:.2f}x\n"
+        f"🛡️ *Gales:* {MAX_GALES}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔗 [ENTRAR NA BLAZE](https://blaze.bet.br/)\n"
+    )
+    if loop_telegram and loop_telegram.is_running():
+        asyncio.run_coroutine_threadsafe(async_broadcast(msg), loop_telegram)
+    else:
+        add_log("Erro: Loop do Telegram não está pronto.")
+
+def enviar_telegram_resultado(res, alvo, win=True):
+    if not application: return
+    emoji = "✅" if win else "❌"
+    titulo = "GREEN CONFIRMADO!" if win else "LOSS (STOP)"
+    modo = "Direta" if state["gale"] == 0 else f"Gale {state['gale']}"
+    placar = f"✅ {stats['vitorias']}  |  ❌ {stats['derrotas']}"
+    
+    msg = (
+        f"{emoji} *{titulo}* {emoji}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🏁 Vela: *{res:.2f}x*\n"
+        f"🎯 Alvo: *{alvo:.2f}x*\n"
+        f"🔍 Modo: {modo if win else '---'}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📊 Placar: `{placar}`"
+    )
+    if loop_telegram and loop_telegram.is_running():
+        asyncio.run_coroutine_threadsafe(async_broadcast(msg), loop_telegram)
+
+# --- LÓGICA V10 ORIGINAL ---
+
+def analisar_v10(h):
+    if len(h) < 15: return None, 0, ""
+    
+    densidade_green = (len([x for x in h[:12] if x >= 2.0]) / 12) * 100
+
+    # 🎯 ESTRATÉGIA PARA VELAS ALTAS (5.0x+)
+    if all(x < 5.0 for x in h[:10]) and h[0] >= 2.0 and h[1] >= 2.0:
+        return "VELA_ROSA", 5.0, "🚀 BUSCA DE VELA ALTA"
+
+    # 🎯 ESTRATÉGIA DE REVERSÃO (2.0x)
+    if h[0] < 2.0 and h[1] < 2.0 and h[2] < 2.0:
+        return "REVERSÃO", 2.0, "🎯 QUEBRA DE SEQUÊNCIA RED"
+
+    # 🎯 ESTRATÉGIA DE FLUXO (1.5x)
+    if h[0] < 2.0 and h[1] >= 2.0 and densidade_green > 40:
+        return "FLUXO", 1.5, "🛡️ ENTRADA DE SEGURANÇA"
+
+    # 🎯 PADRÃO ESPELHO DUPLO (2.0x)
+    if h[0] < 2.0 and h[1] < 2.0 and h[2] >= 2.0 and h[3] >= 2.0:
+        return "ESPELHO", 2.0, "🔄 PADRÃO DE DUPLAS"
+
+    return None, 0, ""
+
+def registrar_resultado(res):
+    global stats, state
+    win = res >= state["alvo"]
+    
+    if win:
+        stats["vitorias"] += 1
+        if state["gale"] == 1: stats["g1_count"] += 1
+        elif state["gale"] == 2: stats["g2_count"] += 1
         
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(self.fetch_loop())
-
-    def run_server(self):
-        uvicorn.run(api_app, host="127.0.0.1", port=7000, log_level="error")
-
-    async def fetch_loop(self):
-        global latest_data_store
-        url_recent = "https://blaze.bet.br/api/singleplayer-originals/originals/roulette_games/recent/1"
-        url_current = "https://blaze.bet.br/api/singleplayer-originals/originals/roulette_games/current/1"
+        if state["alvo"] >= 5.0: stats["win_alta"] += 1
+        elif state["alvo"] >= 2.0: stats["win_20"] += 1
+        else: stats["win_15"] += 1
         
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-            while True:
-                if self.running:
-                    try:
-                        async with session.get(url_recent, timeout=5) as r_rec, \
-                                   session.get(url_current, timeout=5) as r_curr:
-                            if r_rec.status == 200:
-                                payload = {
-                                    "status": (await r_curr.json()).get("status", "unknown"),
-                                    "items": await r_rec.json(),
-                                    "updated_at": datetime.now().strftime("%H:%M:%S")
-                                }
-                                latest_data_store = payload
-                                self.data_signal.emit(payload)
-                    except:
-                        self.error_signal.emit("Erro de conexão...")
-                await asyncio.sleep(2)
-
-    def stop(self):
-        self.running = False
-        global latest_data_store
-        latest_data_store = {"status": "offline", "items": [], "updated_at": ""}
+        add_log(f"GREEN em {res:.2f}x (Alvo {state['alvo']})")
+        enviar_telegram_resultado(res, state["alvo"], True)
+        winsound.Beep(1200, 400)
+        state["ativo"] = False
+        state["gale"] = 0
+    else:
+        if state["gale"] < MAX_GALES:
+            state["gale"] += 1
+            add_log(f"Entrando Gale {state['gale']}")
+            enviar_telegram_sinal(state["desc"], state["alvo"], state["gale"])
+            winsound.Beep(600, 600)
+        else:
+            stats["derrotas"] += 1
+            add_log(f"RED em {res:.2f}x")
+            enviar_telegram_resultado(res, state["alvo"], False)
+            state["ativo"] = False
+            state["gale"] = 0
 
 # --- INTERFACE ---
-class BlazeTerminal(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Blaze Control Panel")
-        self.setFixedSize(850, 420)
-        self.setStyleSheet("QMainWindow { background-color: #0b0e11; }")
-        
-        self.worker = BackendWorker()
-        self.worker.data_signal.connect(self.update_ui)
-        self.init_ui()
 
-    def init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(30, 30, 30, 30)
+def draw_interface(h):
+    os.system('cls' if os.name == 'nt' else 'clear')
+    total = stats["vitorias"] + stats["derrotas"]
+    wr = (stats["vitorias"] / total * 100) if total > 0 else 0
+    
+    print(Fore.CYAN + "╔" + "═"*66 + "╗")
+    print(Fore.CYAN + "║" + Fore.YELLOW + "      DOUGOBRASIL V10 - PAINEL PROFISSIONAL COM LOGS      " + Fore.CYAN + "║")
+    print(Fore.CYAN + "╠" + "═"*32 + "╦" + "═"*33 + "╣")
+    print(Fore.CYAN + f"║ PLACAR: {stats['vitorias']}W - {stats['derrotas']}L".ljust(33) + Fore.CYAN + "║" + Fore.WHITE + f" API: {state['status_conexao']}".ljust(33) + Fore.CYAN + "║")
+    print(Fore.CYAN + f"║ ASSERT: {wr:.1f}%".ljust(33) + Fore.CYAN + "║" + Fore.WHITE + f" TG: {state['status_telegram']}".ljust(33) + Fore.CYAN + "║")
+    print(Fore.CYAN + "╠" + "═"*32 + "╩" + "═"*33 + "╣")
+    print(Fore.CYAN + f"║ [1.5x]: {stats['win_15']} | [2.0x]: {stats['win_20']} | [5.0x]: {stats['win_alta']}".center(66) + Fore.CYAN + "║")
+    print(Fore.CYAN + "╠" + "═"*66 + "╣")
+    
+    # Histórico de Velas
+    print(Fore.CYAN + "║ ", end="")
+    for p in h[:10]:
+        cor = Fore.MAGENTA if p >= 10 else (Fore.CYAN if p >= 5 else (Fore.GREEN if p >= 2 else (Fore.YELLOW if p >= 1.5 else Fore.RED)))
+        print(f"{cor}{p:.2f}x  ", end="")
+    print(Fore.CYAN + "║")
+    
+    print(Fore.CYAN + "╠" + "═"*66 + "╣")
+    if state["ativo"]:
+        fundo = Back.YELLOW if state["gale"] > 0 else Back.GREEN
+        msg = f" >> {state['desc']} | ALVO: {state['alvo']}x | GALE: {state['gale']} << "
+        print(fundo + Fore.BLACK + msg.center(66) + Style.RESET_ALL)
+    else:
+        print(Fore.WHITE + " AGUARDANDO PADRÃO DE ALTA ASSERTIVIDADE... ".center(66))
+    
+    print(Fore.CYAN + "╠" + "═"*66 + "╣")
+    print(Fore.CYAN + "║" + Fore.YELLOW + " LOGS DO SISTEMA:".ljust(66) + Fore.CYAN + "║")
+    for log in state["logs"]:
+        print(Fore.CYAN + "║" + Fore.WHITE + f" {log}".ljust(66) + Fore.CYAN + "║")
+    for _ in range(8 - len(state["logs"])):
+        print(Fore.CYAN + "║".ljust(67) + Fore.CYAN + "║")
+    print(Fore.CYAN + "╚" + "═"*66 + "╝")
 
-        # Header
-        header = QHBoxLayout()
-        v_title = QVBoxLayout()
-        self.main_title = QLabel("BLAZE MONITOR PRO")
-        self.main_title.setStyleSheet("font-size: 22px; font-weight: bold; color: white;")
-        self.status_lbl = QLabel("SISTEMA DESLIGADO")
-        self.status_lbl.setStyleSheet("color: #474d57; font-size: 12px; font-weight: bold;")
-        v_title.addWidget(self.main_title)
-        v_title.addWidget(self.status_lbl)
-        header.addLayout(v_title)
-        header.addStretch()
-        
-        self.time_lbl = QLabel("--:--:--")
-        self.time_lbl.setStyleSheet("font-size: 22px; color: #f12c4c; font-family: 'Consolas';")
-        header.addWidget(self.time_lbl)
-        layout.addLayout(header)
+# --- MONITORAMENTO ---
 
-        # Board
-        self.res_frame = QFrame()
-        self.res_frame.setStyleSheet("background-color: #161a1e; border-radius: 15px; border: 1px solid #2b2f36;")
-        self.res_layout = QHBoxLayout(self.res_frame)
-        self.res_layout.setContentsMargins(20, 40, 20, 40)
-        layout.addWidget(self.res_frame)
+def obter_dados():
+    try:
+        response = requests.get(URL_API, headers=HEADERS, timeout=10)
+        if response.status_code == 200:
+            state["status_conexao"] = "Online"
+            return response.json()
+        state["status_conexao"] = "Erro HTTP"
+        return None
+    except:
+        state["status_conexao"] = "Erro Conexão"
+        return None
 
-        # Botões de Controle
-        btn_layout = QHBoxLayout()
-        
-        self.btn_on = QPushButton("LIGAR CAPTURA")
-        self.btn_on.setCursor(Qt.PointingHandCursor)
-        self.btn_on.setStyleSheet("""
-            QPushButton { background-color: #00c853; color: white; font-weight: bold; border-radius: 8px; padding: 15px; }
-            QPushButton:hover { background-color: #00e676; }
-        """)
-        self.btn_on.clicked.connect(self.start_system)
+def monitor():
+    global state
+    ultimo_id = None
+    add_log("Monitoramento V10 iniciado.")
+    
+    while True:
+        dados = obter_dados()
+        if not dados:
+            time.sleep(2); continue
+            
+        try:
+            raw = dados.get('records') if isinstance(dados, dict) else dados
+            historico = []
+            if raw:
+                for i in raw:
+                    val = i.get('ponto') or i.get('crash_point') or i.get('multiplier')
+                    if val and float(val) > 0: historico.append(float(val))
+            
+            if not historico: continue
+            
+            if historico[0] != ultimo_id:
+                novo_resultado = historico[0]
+                if state["ativo"] and ultimo_id is not None:
+                    registrar_resultado(novo_resultado)
+                
+                ultimo_id = novo_resultado
+                draw_interface(historico)
+                
+                if not state["ativo"]:
+                    est, alvo, desc = analisar_v10(historico)
+                    if est:
+                        state.update({"ativo": True, "estrategia": est, "alvo": alvo, "desc": desc, "gale": 0})
+                        add_log(f"Sinal Detectado: {desc}")
+                        enviar_telegram_sinal(desc, alvo)
+                        winsound.Beep(1000, 200); winsound.Beep(1400, 200)
+                        draw_interface(historico)
+        except Exception as e:
+            add_log(f"Erro Processamento: {e}")
+            
+        time.sleep(1)
 
-        self.btn_off = QPushButton("DESLIGAR")
-        self.btn_off.setCursor(Qt.PointingHandCursor)
-        self.btn_off.setStyleSheet("""
-            QPushButton { background-color: #ff1744; color: white; font-weight: bold; border-radius: 8px; padding: 15px; }
-            QPushButton:hover { background-color: #ff5252; }
-        """)
-        self.btn_off.clicked.connect(self.stop_system)
-
-        btn_layout.addWidget(self.btn_on)
-        btn_layout.addWidget(self.btn_off)
-        layout.addLayout(btn_layout)
-
-    def start_system(self):
-        if not self.worker.isRunning():
-            self.worker.start()
-        self.worker.running = True
-        self.status_lbl.setText("API ONLINE: http://localhost:8000/api")
-        self.status_lbl.setStyleSheet("color: #00ff7f; font-size: 12px; font-weight: bold;")
-
-    def stop_system(self):
-        self.worker.stop()
-        self.status_lbl.setText("SISTEMA DESLIGADO")
-        self.status_lbl.setStyleSheet("color: #474d57; font-size: 12px; font-weight: bold;")
-        self.time_lbl.setText("--:--:--")
-        while self.res_layout.count():
-            item = self.res_layout.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-
-    def update_ui(self, data):
-        if not self.worker.running: return
-        self.time_lbl.setText(data['updated_at'])
-        while self.res_layout.count():
-            item = self.res_layout.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-
-        for item in data['items'][:12]:
-            bg = "#f12c4c" if item['color'] == 1 else "#262f3c" if item['color'] == 2 else "#ffffff"
-            tx = "white" if item['color'] != 0 else "#0b0e11"
-            card = QLabel(str(item['roll']))
-            card.setFixedSize(50, 50)
-            card.setAlignment(Qt.AlignCenter)
-            card.setStyleSheet(f"background-color: {bg}; color: {tx}; border-radius: 10px; font-size: 18px; font-weight: bold;")
-            self.res_layout.addWidget(card)
+def run_telegram():
+    global application, loop_telegram
+    req_config = HTTPXRequest(connect_timeout=60, read_timeout=60)
+    
+    while True:
+        try:
+            state["status_telegram"] = "Iniciando..."
+            application = Application.builder().token(TELEGRAM_TOKEN).request(req_config).build()
+            application.add_handler(CommandHandler("id", get_id_handler))
+            
+            # Inicializa a aplicação e o loop de forma controlada
+            loop_telegram = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop_telegram)
+            
+            # Esta chamada bloqueia o thread, mas o loop_telegram fica ativo para run_coroutine_threadsafe
+            state["status_telegram"] = "Online"
+            application.run_polling(close_loop=False, drop_pending_updates=True)
+        except Exception as e:
+            add_log(f"Reiniciando TG: {e}")
+            state["status_telegram"] = "Reconectando..."
+            time.sleep(10)
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = BlazeTerminal()
-    window.show()
-    sys.exit(app.exec_())
+    # Inicia o monitor em thread separada
+    threading.Thread(target=monitor, daemon=True).start()
+    
+    # Inicia o Telegram no thread principal
+    try:
+        run_telegram()
+    except KeyboardInterrupt:
+        pass
